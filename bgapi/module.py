@@ -26,6 +26,13 @@ SEND_ATTRIBUTE = "Attribute Send in Progress"
 CONNECT = "Connection Attempt in Progress"
 DISCONNECT = "Disconnect in Progress"
 CONN_PARAM_UPDATE = "Connection Parameter Update Expected"
+SET_MODE = "Set Mode in Progress"
+END_PROCEDURE = "GAP End Procedure in Progress"
+DELETE_BONDING = "Delete Bonding in Progress"
+SET_SCAN_PARAMETERS = "Set Scan Parameters in Progress"
+SM_SET_PARAMETERS = "SM Set Parameters in Progress"
+SM_SET_BONDABLE_MODE = "SM Set Bondable Mode in Progress"
+GAP_DISCOVER = "GAP Discover in Progress"
 
 BLE_GAP_AD_TYPE_STRINGS = {
     0x01: "BLE_GAP_AD_TYPE_FLAGS",
@@ -520,7 +527,7 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
             self._api.ble_cmd_system_address_get()
         return self.address
 
-    def reset_ble_state(self):
+    def reset_ble_state(self, timeout=1):
         """ Disconnect, End Procedure, and Disable Advertising """
         self._api.ble_cmd_gap_set_mode(gap_discoverable_mode['gap_non_discoverable'],
                                        gap_connectable_mode['gap_non_connectable'])
@@ -532,7 +539,11 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
                 self.disconnect(i)
             except RemoteError:
                 pass
-        self._api.ble_cmd_gap_end_procedure()
+        try:
+            with self.procedure_call(END_PROCEDURE, timeout) as handle:
+                self._api.ble_cmd_gap_end_procedure()
+        except RemoteError:
+            pass
 
     def disconnect(self, connection):
         try:
@@ -548,22 +559,38 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
             else:
                 raise
 
-    def allow_bonding(self):
-        self._api.ble_cmd_sm_set_bondable_mode(1)
+    def allow_bonding(self, timeout=1):
+        with self.procedure_call(SM_SET_BONDABLE_MODE, timeout):
+            self._api.ble_cmd_sm_set_bondable_mode(1)
 
-    def disallow_bonding(self):
-        self._api.ble_cmd_sm_set_bondable_mode(0)
+    def disallow_bonding(self, timeout=1):
+        with self.procedure_call(SM_SET_BONDABLE_MODE, timeout):
+            self._api.ble_cmd_sm_set_bondable_mode(0)
 
-    def delete_bonding(self, handle=0):
-        self._api.ble_cmd_sm_delete_bonding(handle)
+    def delete_bonding(self, handle=0, timeout=1):
+        with self.procedure_call(DELETE_BONDING, timeout):
+            self._api.ble_cmd_sm_delete_bonding(handle)
 
     def set_device_capabilities(self, mitm=True, keysize=16, io=sm_io_capability['sm_io_capability_noinputnooutput']):
-        self._api.ble_cmd_sm_set_parameters(mitm=1 if mitm else 0, min_key_size=keysize, io_capabilities=io)
+        with self.procedure_call(SM_SET_PARAMETERS, 1) as handle:
+            self._api.ble_cmd_sm_set_parameters(mitm=1 if mitm else 0, min_key_size=keysize, io_capabilities=io)
 
     def set_out_of_band_data(self, oob):
         self._api.ble_cmd_sm_set_oob_data(oob.decode("hex"))
 
 #------------- Response and Event Callbacks  -------------#
+
+    def ble_evt_sm_bond_status(self, bond, keysize, mitm, keys):
+        super(BlueGigaModule, self).ble_evt_sm_bond_status(bond, keysize, mitm, keys)
+        self.most_recent_connection.procedure_complete(START_ENCRYPTION)
+
+    def ble_rsp_sm_set_bondable_mode(self):
+        super(BlueGigaModule, self).ble_rsp_sm_set_bondable_mode()
+        self.procedure_complete(SM_SET_BONDABLE_MODE)
+
+    def ble_rsp_sm_set_parameters(self):
+        super(BlueGigaModule, self).ble_rsp_sm_set_parameters()
+        self.procedure_complete(SM_SET_PARAMETERS)
 
     def ble_rsp_system_address_get(self, address):
         super(BlueGigaModule, self).ble_rsp_system_address_get(address)
@@ -587,7 +614,18 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
             self.connections[connection].procedure_complete(CONN_PARAM_UPDATE)
         if flags & connection_status_mask['connection_encrypted']:
             self.connections[connection].flags = flags
-            self.connections[connection].procedure_complete(START_ENCRYPTION)
+
+    def ble_rsp_sm_delete_bonding(self, result):
+        super(BlueGigaModule, self).ble_rsp_sm_delete_bonding(result)
+        self.procedure_complete(DELETE_BONDING, result=result)
+
+    def ble_rsp_gap_set_mode(self, result):
+        super(BlueGigaModule, self).ble_rsp_gap_set_mode(result)
+        self.procedure_complete(SET_MODE, result=result)
+
+    def ble_rsp_gap_end_procedure(self, result):
+        super(BlueGigaModule, self).ble_rsp_gap_end_procedure(result)
+        self.procedure_complete(END_PROCEDURE, result=result)
 
     def ble_rsp_system_get_info(self, major, minor, patch, build, ll_version, protocol_version, hw):
         super(BlueGigaModule, self).ble_rsp_system_get_info(major, minor, patch, build, ll_version, protocol_version, hw)
@@ -633,10 +671,14 @@ class BlueGigaClient(BlueGigaModule):
         return self._scan(mode=gap_discover_mode['gap_discover_observation'], timeout=timeout)
 
     def active_scan(self, scan_interval = 0x4B, scan_window = 0x32):
-        return self._api.ble_cmd_gap_set_scan_parameters(scan_interval, scan_window, 1)
+        with self.procedure_call(SET_SCAN_PARAMETERS, 1) as handle:
+            status = self._api.ble_cmd_gap_set_scan_parameters(scan_interval, scan_window, 1)
+        return status
 
     def disable_scan(self, scan_interval = 0x4B, scan_window = 0x32):
-        return self._api.ble_cmd_gap_set_scan_parameters(scan_interval, scan_window, 0)
+        with self.procedure_call(SET_SCAN_PARAMETERS, 1) as handle:
+            status = self._api.ble_cmd_gap_set_scan_parameters(scan_interval, scan_window, 0)
+        return status
 
     def connect(self, target, timeout=5, conn_interval_min=0x20, conn_interval_max=0x30, connection_timeout=100, latency=0):
         with self.procedure_call(CONNECT, timeout):
@@ -653,17 +695,27 @@ class BlueGigaClient(BlueGigaModule):
     def _scan(self, mode, timeout):
         self.scan_responses = None
         now = start = time.time()
-        self._api.ble_cmd_gap_discover(mode=mode)
+        with self.procedure_call(GAP_DISCOVER, timeout):
+            self._api.ble_cmd_gap_discover(mode=mode)
         while now < start + timeout:
             time.sleep(timeout - (now - start))
             now = time.time()
-        self._api.ble_cmd_gap_end_procedure()
+        with self.procedure_call(END_PROCEDURE, timeout):
+            self._api.ble_cmd_gap_end_procedure()
         return self.scan_responses
+
+    def ble_rsp_gap_discover(self, result):
+        super(BlueGigaClient, self).ble_rsp_gap_discover(result=result)
+        self.procedure_complete(GAP_DISCOVER, result=result)
 
     def ble_rsp_attclient_write_command(self, connection, result):
         super(BlueGigaClient, self).ble_rsp_attclient_write_command(connection=connection, result=result)
         self.procedure_complete(PROCEDURE, result=result)
         self.connections[connection].procedure_complete(PROCEDURE, result=result)
+
+    def ble_rsp_gap_set_scan_parameters(self, result):
+        super(BlueGigaClient, self).ble_rsp_gap_set_scan_parameters(result)
+        self.procedure_complete(SET_SCAN_PARAMETERS, result=result)
 
     #----------------  Events triggered by incoming data ------------------#
 
