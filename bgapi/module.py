@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 
 import logging
+import math
 import sys
 import time
 import struct
@@ -249,7 +250,7 @@ class ProcedureManager(object):
             self.set_max_procedures(6)
         with self._typeLocks[procedure_type]:
             assert procedure_type not in self._handles # Nobody else is waiting for this procedure type
-
+        
             handle = ProcedureCallHandle()
             self._handles[procedure_type] = handle
 
@@ -436,7 +437,9 @@ class BLEConnection(ProcedureManager):
     @connected
     def write_by_handle(self, handle, value, timeout=3):
         with self.procedure_call(WRITE_ATTRIBUTE, timeout):
-            self._api.ble_cmd_attclient_attribute_write(self.handle, handle, value)
+            with self.procedure_call(PROCEDURE, timeout):
+                self._api.ble_cmd_attclient_attribute_write(self.handle, handle, value)
+            self.procedure_complete(WRITE_ATTRIBUTE)
 
     def wr_noresp_by_uuid(self, uuid, value, timeout=3):
         for handle in self.uuid_handle[uuid]:
@@ -469,21 +472,23 @@ class BLEConnection(ProcedureManager):
 
     @connected
     def reliable_write_by_handle(self, handle, value, offset=0, timeout=3):
-        for i in range((len(value) / 20)+1):
-            chunk = value[20*i+offset:min(20*(i+1)+offset, len(value))]
-            with self.procedure_call(PROCEDURE, timeout):
-                self._api.ble_cmd_attclient_prepare_write(self.handle, handle, 20*i+offset, chunk)
+        total_timeout = math.ceil((len(value) / 20)+1) * timeout
+        with self.procedure_call(WRITE_ATTRIBUTE, total_timeout):
+            for i in range((len(value) / 20)+1):
+                chunk = value[20*i+offset:min(20*(i+1)+offset, len(value))]
+                with self.procedure_call(PROCEDURE, timeout):
+                    self._api.ble_cmd_attclient_prepare_write(self.handle, handle, 20*i+offset, chunk)
 
-        with self.procedure_call(PROCEDURE, timeout):
-            self._api.ble_cmd_attclient_execute_write(self.handle, 1) # 1 = commit, 0 = cancel
+            with self.procedure_call(PROCEDURE, timeout):
+                self._api.ble_cmd_attclient_execute_write(self.handle, 1) # 1 = commit, 0 = cancel
+            self.procedure_complete(WRITE_ATTRIBUTE)
 
     def characteristic_subscription(self, characteristic, indicate=True, notify=True, timeout=1):
         descriptor = characteristic.get_descriptor_by_uuid(GATTCharacteristic.CLIENT_CHARACTERISTIC_CONFIG)
         if not descriptor:
             raise BlueGigaModuleException("Unable to find Client Characteristic Config (must Read by Type 0x2902)")
         config = struct.pack('BB', (2 if indicate else 0) + (1 if notify else 0), 0)
-        with self.procedure_call(PROCEDURE, timeout):
-            self.write_by_handle(descriptor.handle, config, timeout=timeout)
+        self.write_by_handle(descriptor.handle, config, timeout=timeout)
 
     @connected
     def request_encryption(self, bond=True, timeout=1):
@@ -744,11 +749,7 @@ class BlueGigaClient(BlueGigaModule):
         self.procedure_complete(PROCEDURE, result=result)
         self.connections[connection].procedure_complete(PROCEDURE, result=result)
         self.connections[connection].procedure_complete(READ_ATTRIBUTE, result=result) # When the attribute read fails
-
-    def ble_rsp_attclient_attribute_write(self, connection, result):
-        super(BlueGigaClient, self).ble_rsp_attclient_attribute_write(connection, result)
-        self.procedure_complete(PROCEDURE, result=result)
-        self.connections[connection].procedure_complete(WRITE_ATTRIBUTE, result=result)
+        
 
 class BlueGigaServer(BlueGigaModule):
     def __init__(self, port, baud=115200, timeout=0.1):
