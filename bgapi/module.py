@@ -705,7 +705,8 @@ class BlueGigaClient(BlueGigaModule):
         while now < start + timeout:
             time.sleep(timeout - (now - start))
             now = time.time()
-        with self.procedure_call(END_PROCEDURE, timeout):
+        # gap_end_procedure can sometimes be delayed by incoming adv, so set minimum timeout of 10s
+        with self.procedure_call(END_PROCEDURE, max(timeout, 10)):
             self._api.ble_cmd_gap_end_procedure()
         return self.scan_responses
 
